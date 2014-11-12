@@ -1,7 +1,7 @@
 name:            rdf4h
 version:         1.2.6
 synopsis:        A library for RDF processing in Haskell
-description:     
+description:
   'RDF for Haskell' is a library for working with RDF in Haskell.
   At present it includes parsers and serializers for RDF in the N-Triples
   and Turtle, and parsing support for RDF/XML. It provides abilities such as querying
@@ -62,10 +62,11 @@ library
                  , Text.RDF.RDF4H.Interact
   hs-source-dirs:  src
   extensions:      BangPatterns RankNTypes MultiParamTypeClasses Arrows FlexibleContexts OverloadedStrings
+  ghc-prof-options: -auto-all -prof -caf-all
   ghc-options:     -Wall -fno-warn-unused-do-bind -funbox-strict-fields -O2
 
 executable rdf4h
-  main-is:         Rdf4hParseMain.hs 
+  main-is:         Rdf4hParseMain.hs
   if flag(small_base)
     build-depends: base >= 3, bytestring
   else
@@ -78,7 +79,8 @@ executable rdf4h
                  , hashable
                  , network-uri
   hs-source-dirs:  src
-  extensions:      BangPatterns RankNTypes ScopedTypeVariables MultiParamTypeClasses OverloadedStrings
+  extensions:      BangPatterns RankNTypes ScopedTypeVariables MultiParamTypeClasses FlexibleContexts OverloadedStrings
+  ghc-prof-options: -auto-all -prof -caf-all
   ghc-options:     -Wall -fno-warn-unused-do-bind -funbox-strict-fields
 
 test-suite test-rdf4h
