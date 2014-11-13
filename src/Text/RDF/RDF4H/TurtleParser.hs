@@ -1,4 +1,4 @@
--- |An 'RdfParser' implementation for the Turtle format 
+-- |An 'RdfParser' implementation for the Turtle format
 -- <http://www.w3.org/TeamSubmission/turtle/>.
 
 module Text.RDF.RDF4H.TurtleParser(
@@ -22,7 +22,7 @@ import Data.Char (isDigit)
 import Control.Monad
 import Data.Maybe (fromMaybe)
 
--- |An 'RdfParser' implementation for parsing RDF in the 
+-- |An 'RdfParser' implementation for parsing RDF in the
 -- Turtle format. It takes optional arguments representing the base URL to use
 -- for resolving relative URLs in the document (may be overridden in the document
 -- itself using the \@base directive), and the URL to use for the document itself
@@ -34,7 +34,7 @@ data TurtleParser = TurtleParser (Maybe BaseUrl) (Maybe T.Text)
 
 -- |'TurtleParser' is an instance of 'RdfParser'.
 instance RdfParser TurtleParser where
-  parseString (TurtleParser bUrl dUrl)  = parseString' bUrl dUrl 
+  parseString (TurtleParser bUrl dUrl)  = parseString' bUrl dUrl
   parseFile   (TurtleParser bUrl dUrl)  = parseFile' bUrl dUrl
   parseURL    (TurtleParser bUrl dUrl)  = parseURL'  bUrl dUrl
 
@@ -158,7 +158,7 @@ t_object =
 -- collection: '(' ws* itemList? ws* ')'
 -- itemList:      object (ws+ object)*
 t_collection:: GenParser ParseState ()
-t_collection = 
+t_collection =
   -- ( object1 object2 ) is short for:
   -- [ rdf:first object1; rdf:rest [ rdf:first object2; rdf:rest rdf:nil ] ]
   -- ( ) is short for the resource:  rdf:nil
@@ -185,7 +185,7 @@ blank_as_obj =
   poList
   where
     genBlank = liftM BNodeGen (try (string "[]") >> nextIdCounter)
-    poList   = between (char '[') (char ']') $ 
+    poList   = between (char '[') (char ']') $
                  liftM BNodeGen nextIdCounter >>= \bSubj ->   -- generate new bnode
                   void
                   (addTripleForObject bSubj >>   -- add triple with bnode as object
@@ -229,7 +229,7 @@ t_quotedString = t_longString <|> t_string
 
 -- a non-long string: any number of scharacters (echaracter without ") inside doublequotes.
 t_string  :: GenParser ParseState T.Text
-t_string = liftM T.concat (between (char '"') (char '"') (many t_scharacter))
+t_string = liftM T.pack (between (char '"') (char '"') (many t_scharacter))
 
 t_longString  :: GenParser ParseState T.Text
 t_longString =
@@ -322,7 +322,7 @@ t_ucharacter  :: GenParser ParseState String
 t_ucharacter =
   try (liftM T.unpack unicode_escape) <|>
   try (string "\\>") <|>
-  liftM T.unpack (non_ctrl_char_except ">")
+  liftM (\c -> [c]) (non_ctrl_char_except ">")
 
 t_nameChar :: GenParser ParseState Char
 t_nameChar = t_nameStartChar <|> char '-' <|> char '\x00B7' <|> satisfy f
@@ -345,7 +345,7 @@ longString_char  =
           (char '\\' >> bs1 '\\') <|> (char '"' >> bs1 '"')
     twoDoubleQuote  = string "\"\"" >> notFollowedBy (char '"') >> bs "\"\""
     oneDoubleQuote  = char '"' >> notFollowedBy (char '"') >> bs1 '"'
-    safeNonCtrlChar = non_ctrl_char_except "\\\""
+    safeNonCtrlChar = liftM T.singleton (non_ctrl_char_except "\\\"")
 
 bs1 :: Char -> GenParser ParseState T.Text
 bs1 = return . T.singleton
@@ -372,14 +372,14 @@ t_hex = satisfy (\c -> isDigit c || (c >= 'A' && c <= 'F')) <?> "hexadecimal dig
 
 -- characters used in (non-long) strings; any echaracters except ", or an escaped \"
 -- echaracter - #x22 ) | '\"'
-t_scharacter  :: GenParser ParseState T.Text
+t_scharacter  :: GenParser ParseState Char
 t_scharacter =
-  (try (string "\\\"") >> return (T.singleton '"'))
+  (try (string "\\\"") >> return '"')
      <|> try (do {char '\\';
-                  (char 't' >> return (T.singleton '\t')) <|>
-                  (char 'n' >> return (T.singleton '\n')) <|>
-                  (char 'r' >> return (T.singleton '\r'))}) -- echaracter part 1
-     <|> unicode_escape
+                  (char 't' >> return '\t') <|>
+                  (char 'n' >> return '\n') <|>
+                  (char 'r' >> return '\r')}) -- echaracter part 1
+     <|> liftM (head . T.unpack) unicode_escape
      <|> (non_ctrl_char_except "\\\"" >>= \s -> return $! s) -- echaracter part 2 minus "
 
 unicode_escape  :: GenParser ParseState T.Text
@@ -389,9 +389,8 @@ unicode_escape =
   (char 'u' >> count 4 t_hex >>= \cs -> return $!  "\\u" `T.append`  T.pack cs) <|>
   (char 'U' >> count 8 t_hex >>= \cs -> return $!  "\\U" `T.append` T.pack cs))
 
-non_ctrl_char_except  :: String -> GenParser ParseState T.Text
+non_ctrl_char_except  :: String -> GenParser ParseState Char
 non_ctrl_char_except cs =
-  liftM T.singleton
     (satisfy (\ c -> c <= '\1114111' && (c >= ' ' && c `notElem` cs)))
 
 {-# INLINE in_range #-}
@@ -543,19 +542,19 @@ addTripleForObject obj =
 --
 -- The @BaseUrl@ is used as the base URI within the document for resolving any relative URI references.
 -- It may be changed within the document using the @\@base@ directive. At any given point, the current
--- base URI is the most recent @\@base@ directive, or if none, the @BaseUrl@ given to @parseURL@, or 
+-- base URI is the most recent @\@base@ directive, or if none, the @BaseUrl@ given to @parseURL@, or
 -- if none given, the document URL given to @parseURL@. For example, if the @BaseUrl@ were
--- @http:\/\/example.org\/@ and a relative URI of @\<b>@ were encountered (with no preceding @\@base@ 
+-- @http:\/\/example.org\/@ and a relative URI of @\<b>@ were encountered (with no preceding @\@base@
 -- directive), then the relative URI would expand to @http:\/\/example.org\/b@.
 --
 -- The document URL is for the purpose of resolving references to 'this document' within the document,
 -- and may be different than the actual location URL from which the document is retrieved. Any reference
--- to @\<>@ within the document is expanded to the value given here. Additionally, if no @BaseUrl@ is 
+-- to @\<>@ within the document is expanded to the value given here. Additionally, if no @BaseUrl@ is
 -- given and no @\@base@ directive has appeared before a relative URI occurs, this value is used as the
 -- base URI against which the relative URI is resolved.
 --p
 -- Returns either a @ParseFailure@ or a new RDF containing the parsed triples.
-parseURL' :: forall rdf. (RDF rdf) => 
+parseURL' :: forall rdf. (RDF rdf) =>
                  Maybe BaseUrl       -- ^ The optional base URI of the document.
                  -> Maybe T.Text -- ^ The document URI (i.e., the URI of the document itself); if Nothing, use location URI.
                  -> String           -- ^ The location URI from which to retrieve the Turtle document.
@@ -574,7 +573,7 @@ parseFile' bUrl docUrl fpath =
   TIO.readFile fpath >>= \bs' -> return $ handleResult bUrl (runParser t_turtleDoc initialState (maybe "" T.unpack docUrl) bs')
   where initialState = (bUrl, docUrl, 1, PrefixMappings Map.empty, [], [], [], Seq.empty)
 
--- |Parse the given string as a Turtle document. The arguments and return type have the same semantics 
+-- |Parse the given string as a Turtle document. The arguments and return type have the same semantics
 -- as <parseURL>, except that the last @String@ argument corresponds to the Turtle document itself as
 -- a string rather than a location URI.
 parseString' :: forall rdf. (RDF rdf) => Maybe BaseUrl -> Maybe T.Text -> T.Text -> Either ParseFailure rdf

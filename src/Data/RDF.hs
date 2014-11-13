@@ -14,6 +14,7 @@ module Data.RDF (
   -- * Export RDF type class instances
   module Data.RDF.TriplesGraph,
   module Data.RDF.MGraph,
+  module Data.RDF.MTriples,
 
   -- * Export RDF parsers and serializers
   module Text.RDF.RDF4H.NTriplesSerializer,
@@ -34,3 +35,4 @@ import Text.RDF.RDF4H.TurtleParser
 import Text.RDF.RDF4H.XmlParser
 import Data.RDF.Types
 import Data.RDF.Query
+import Data.RDF.MTriples
