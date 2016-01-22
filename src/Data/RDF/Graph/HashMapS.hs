@@ -1,11 +1,11 @@
-{-# LANGUAGE TupleSections #-}
--- |A simple graph implementation backed by 'Data.HashMap'.
+{-# LANGUAGE TupleSections, GeneralizedNewtypeDeriving #-}
+-- |A graph implementation mapping hashed S to a mapping of
+--  hashed P to hashed O, backed by 'Data.HashMap'.
 
-module Data.RDF.MGraph(MGraph, empty, mkRdf, triplesOf, select, query)
-
-where
+module Data.RDF.Graph.HashMapS (HashMapS) where
 
 import Prelude hiding (pred)
+import Control.DeepSeq (NFData)
 import Data.RDF.Types
 import Data.RDF.Query
 import Data.RDF.Namespace
@@ -19,6 +19,39 @@ import Data.List
 
 -- |A map-based graph implementation.
 --
+-- This instance of 'RDF' is an adjacency map with each subject
+-- mapping to a mapping from a predicate node to to the adjacent nodes
+-- via that predicate.
+--
+-- Given the following triples graph::
+--
+-- @
+--   (http:\/\/example.com\/s1,http:\/\/example.com\/p1,http:\/\/example.com\/o1)
+--   (http:\/\/example.com\/s1,http:\/\/example.com\/p1,http:\/\/example.com\/o2)
+--   (http:\/\/example.com\/s1,http:\/\/example.com\/p2,http:\/\/example.com\/o1)
+--   (http:\/\/example.com\/s2,http:\/\/example.com\/p3,http:\/\/example.com\/o3)
+-- @
+--
+-- where
+--
+-- > hash "http://example.com/s1" = 1600134414
+-- > hash "http://example.com/s2" = 1600134413
+-- > hash "http://example.com/p1" = 1616912099
+-- > hash "http://example.com/p2" = 1616912096
+-- > hash "http://example.com/p3" = 1616912097
+-- > hash "http://example.com/o1" = 1935686794
+-- > hash "http://example.com/o2" = 1935686793
+-- > hash "http://example.com/o3" = 1935686792
+--
+-- the in-memory hashmap representation of the triples graph is:
+--
+-- @
+-- key:1600134414, value:(key:1616912099, value:[1935686794    -- (..\/s1,..\/p1,..\/o1)
+--                                              ,1935686793];  -- (..\/s1,..\/p1,..\/o2)
+--                        key:1616912096, value:[1935686794]); -- (..\/s1,..\/p2,..\/o1)
+-- key:1600134413, value:(key:1616912097, value:[1935686792])  -- (..\/s1,..\/p3,..\/o3)
+-- @
+--
 -- Worst-case time complexity of the graph functions, with respect
 -- to the number of triples, are:
 --
@@ -31,19 +64,21 @@ import Data.List
 --  * 'select'   : O(n)
 --
 --  * 'query'    : O(log n)
-newtype MGraph = MGraph (TMaps, Maybe BaseUrl, PrefixMappings)
+newtype HashMapS = HashMapS (TMaps, Maybe BaseUrl, PrefixMappings)
+                 deriving (NFData)
 
-instance RDF MGraph where
+instance RDF HashMapS where
   baseUrl           = baseUrl'
   prefixMappings    = prefixMappings'
   addPrefixMappings = addPrefixMappings'
   empty             = empty'
   mkRdf             = mkRdf'
   triplesOf         = triplesOf'
+  uniqTriplesOf     = uniqTriplesOf'
   select            = select'
   query             = query'
 
-instance Show MGraph where
+instance Show HashMapS where
   show gr = concatMap (\t -> show t ++ "\n")  (triplesOf gr)
 
 -- some convenience type alias for readability
@@ -58,22 +93,22 @@ type TMap   = HashMap Node AdjacencyMap
 type TMaps  = (TMap, TMap)
 
 
-baseUrl' :: MGraph -> Maybe BaseUrl
-baseUrl' (MGraph (_, baseURL, _)) = baseURL
+baseUrl' :: HashMapS -> Maybe BaseUrl
+baseUrl' (HashMapS (_, baseURL, _)) = baseURL
 
-prefixMappings' :: MGraph -> PrefixMappings
-prefixMappings' (MGraph (_, _, pms)) = pms
+prefixMappings' :: HashMapS -> PrefixMappings
+prefixMappings' (HashMapS (_, _, pms)) = pms
 
-addPrefixMappings' :: MGraph -> PrefixMappings -> Bool -> MGraph
-addPrefixMappings' (MGraph (ts, baseURL, pms)) pms' replace = 
+addPrefixMappings' :: HashMapS -> PrefixMappings -> Bool -> HashMapS
+addPrefixMappings' (HashMapS (ts, baseURL, pms)) pms' replace = 
   let merge = if replace then flip mergePrefixMappings else mergePrefixMappings
-  in  MGraph (ts, baseURL, merge pms pms')
+  in  HashMapS (ts, baseURL, merge pms pms')
 
-empty' :: MGraph
-empty' = MGraph ((HashMap.empty, HashMap.empty), Nothing, PrefixMappings Map.empty)
+empty' :: HashMapS
+empty' = HashMapS ((HashMap.empty, HashMap.empty), Nothing, PrefixMappings Map.empty)
 
-mkRdf' :: Triples -> Maybe BaseUrl -> PrefixMappings -> MGraph
-mkRdf' ts baseURL pms = MGraph (mergeTs (HashMap.empty, HashMap.empty) ts, baseURL, pms)
+mkRdf' :: Triples -> Maybe BaseUrl -> PrefixMappings -> HashMapS
+mkRdf' ts baseURL pms = HashMapS (mergeTs (HashMap.empty, HashMap.empty) ts, baseURL, pms)
 
 mergeTs :: TMaps -> [Triple] -> TMaps
 mergeTs = foldl' mergeT
@@ -102,9 +137,13 @@ mergeT'' m s p o =
     get = HashMap.lookupDefault Set.empty
 
 -- 3 following functions support triplesOf
-triplesOf' :: MGraph -> Triples
-triplesOf' (MGraph ((spoMap, _), _, _)) = concatMap (uncurry tripsSubj) subjPredMaps
+triplesOf' :: HashMapS -> Triples
+triplesOf' (HashMapS ((spoMap, _), _, _)) = concatMap (uncurry tripsSubj) subjPredMaps
   where subjPredMaps = HashMap.toList spoMap
+
+-- naive implementation for now
+uniqTriplesOf' :: HashMapS -> Triples
+uniqTriplesOf' = nub . expandTriples
 
 tripsSubj :: Subject -> AdjacencyMap -> Triples
 tripsSubj s adjMap = concatMap (uncurry (tfsp s)) (HashMap.toList adjMap)
@@ -114,8 +153,8 @@ tripsForSubjPred :: Subject -> Predicate -> Adjacencies -> Triples
 tripsForSubjPred s p adjs = map (Triple s p) (Set.toList adjs)
 
 -- supports select
-select' :: MGraph -> NodeSelector -> NodeSelector -> NodeSelector -> Triples
-select' (MGraph ((spoMap,_),_,_)) subjFn predFn objFn =
+select' :: HashMapS -> NodeSelector -> NodeSelector -> NodeSelector -> Triples
+select' (HashMapS ((spoMap,_),_,_)) subjFn predFn objFn =
   map (\(s,p,o) -> Triple s p o) $ Set.toList $ sel1 subjFn predFn objFn spoMap
 
 sel1 :: NodeSelector -> NodeSelector -> NodeSelector -> TMap -> HashSet (Node, Node, Node)
@@ -143,8 +182,8 @@ sel3 (Just objFn) (p, os) = Set.map (\o -> (p, o)) $ Set.filter objFn os
 sel3 Nothing      (p, os) = Set.map (\o -> (p, o)) os
 
 -- support query
-query' :: MGraph -> Maybe Node -> Maybe Predicate -> Maybe Node -> Triples
-query' (MGraph (m,_ , _)) subj pred obj = map f $ Set.toList $ q1 subj pred obj m
+query' :: HashMapS -> Maybe Subject -> Maybe Predicate -> Maybe Object -> Triples
+query' (HashMapS (m,_ , _)) subj pred obj = map f $ Set.toList $ q1 subj pred obj m
   where f (s, p, o) = Triple s p o
 
 q1 :: Maybe Node -> Maybe Node -> Maybe Node -> TMaps -> HashSet (Node, Node, Node)

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveGeneric, OverloadedStrings, GeneralizedNewtypeDeriving #-}
 
 module Data.RDF.Types (
 
@@ -9,13 +9,16 @@ module Data.RDF.Types (
 
   -- * Constructor functions
   plainL,plainLL,typedL,
-  unode,bnode,lnode,triple,
+  unode,bnode,lnode,triple,unodeValidate,uriValidate,
 
   -- * Node query function
   isUNode,isLNode,isBNode,
 
+  -- * Miscellaneous
+  resolveQName, absolutizeUrl, isAbsoluteUri, mkAbsoluteUrl,escapeRDFSyntax,fileSchemeToFilePath,
+
   -- * RDF Type
-  RDF(baseUrl,prefixMappings,addPrefixMappings,empty,mkRdf,triplesOf,select,query),
+  RDF(baseUrl,prefixMappings,addPrefixMappings,empty,mkRdf,triplesOf,uniqTriplesOf,select,query),
 
   -- * Parsing RDF
   RdfParser(parseString,parseFile,parseURL),
@@ -28,7 +31,7 @@ module Data.RDF.Types (
   PrefixMappings(PrefixMappings),PrefixMapping(PrefixMapping),
 
   -- * Supporting types
-  BaseUrl(BaseUrl), NodeSelector, ParseFailure(ParseFailure),
+  BaseUrl(BaseUrl), NodeSelector, ParseFailure(ParseFailure)
 
 ) where
 
@@ -36,11 +39,19 @@ import Prelude hiding (pred)
 import qualified Data.Text as T
 import System.IO
 import Text.Printf
+import Data.Binary
 import Data.Map(Map)
+import Data.Maybe (fromJust)
 import GHC.Generics (Generic)
 import Data.Hashable(Hashable)
 import qualified Data.List as List
 import qualified Data.Map as Map
+import qualified Network.URI as Network (uriPath,parseURI)
+import Control.DeepSeq (NFData,rnf)
+import Text.Parsec
+import Text.Parsec.Text
+import Network.URI
+import Codec.Binary.UTF8.String
 
 -------------------
 -- LValue and constructor functions
@@ -60,7 +71,14 @@ data LValue =
   -- |A typed literal value consisting of the literal value and
   -- the URI of the datatype of the value, respectively.
   | TypedL !T.Text  !T.Text
-    deriving Generic
+    deriving (Generic,Show)
+
+instance Binary LValue
+
+instance NFData LValue where
+  rnf (PlainL t) = rnf t
+  rnf (PlainLL t1 t2) = rnf t1 `seq` rnf t2
+  rnf (TypedL t1 t2) = rnf t1 `seq` rnf t2
 
 -- |Return a PlainL LValue for the given string value.
 {-# INLINE plainL #-}
@@ -86,7 +104,7 @@ typedL val dtype = TypedL (canonicalize dtype val) dtype
 -- node ('BNode'), or a literal node ('LNode').
 data Node =
 
-  -- |An RDF URI reference. See
+  -- |An RDF URI reference. URIs conform to the RFC3986 standard. See
   -- <http://www.w3.org/TR/rdf-concepts/#section-Graph-URIref> for more
   -- information.
   UNode !T.Text
@@ -104,7 +122,15 @@ data Node =
   -- <http://www.w3.org/TR/rdf-concepts/#section-Graph-Literal> for more
   -- information.
   | LNode !LValue
-    deriving Generic
+    deriving (Generic,Show)
+
+instance Binary Node
+
+instance NFData Node where
+  rnf (UNode t) = rnf t
+  rnf (BNode b) = rnf b
+  rnf (BNodeGen bgen) = rnf bgen
+  rnf (LNode lvalue) = rnf lvalue
 
 -- |An alias for 'Node', defined for convenience and readability purposes.
 type Subject = Node
@@ -115,10 +141,86 @@ type Predicate = Node
 -- |An alias for 'Node', defined for convenience and readability purposes.
 type Object = Node
 
--- |Return a URIRef node for the given bytetring URI.
+-- |Return a URIRef node for the given URI.
 {-# INLINE unode #-}
 unode :: T.Text -> Node
 unode = UNode
+
+-- For background on 'unodeValidate', see:
+-- http://stackoverflow.com/questions/33250184/unescaping-unicode-literals-found-in-haskell-strings
+--
+-- Escaped literals are defined in the Turtle spec, and is
+-- inherited by the NTriples and XML specification.
+-- http://www.w3.org/TR/turtle/#sec-escapes
+
+-- |Validate a URI and return it in a @Just UNode@ if it is
+--  valid, otherwise @Nothing@ is returned. Performs the following:
+--
+--  1. unescape unicode RDF literals
+--  2. checks validity of this unescaped URI using 'isURI' from 'Network.URI'
+--  3. if the unescaped URI is valid then 'Node' constructed with 'UNode'
+unodeValidate :: T.Text -> Maybe Node
+unodeValidate t = case isRdfURI t of
+                    Left _err -> Nothing
+                    Right uri -> Just (UNode uri)
+
+isRdfURI :: T.Text -> Either ParseError T.Text
+isRdfURI t = parse (isRdfURIParser  <* eof) ("Invalid URI: " ++ T.unpack t) t
+
+-- [18]	IRIREF from Turtle spec
+isRdfURIParser :: GenParser () T.Text
+isRdfURIParser = T.concat <$> many (T.singleton <$> noneOf (['\x00'..'\x20'] ++ [' ','<','>','"','{','}','|','^','`','\\']) <|> nt_uchar)
+
+-- [10] UCHAR
+nt_uchar :: GenParser () T.Text
+nt_uchar =
+    (try (char '\\' >> char 'u' >> count 4 hexDigit >>= \cs -> return $ T.pack (uEscapedToXEscaped cs)) <|>
+     try (char '\\' >> char 'U' >> count 8 hexDigit >>= \cs -> return $ T.pack (uEscapedToXEscaped cs)))
+
+uEscapedToXEscaped :: String -> String
+uEscapedToXEscaped ss =
+    let str = ['\\','x'] ++ ss
+    in read ("\"" ++ str ++ "\"")
+
+-- |Validate a Text URI and return it in a @Just Text@ if it is
+--  valid, otherwise @Nothing@ is returned. See 'unodeValidate'.
+uriValidate :: T.Text -> Maybe T.Text
+uriValidate t = case isRdfURI t of
+                  Left _err -> Nothing
+                  Right uri -> Just uri
+
+escapeRDFSyntax :: T.Text -> T.Text
+escapeRDFSyntax t = T.pack uri
+    where
+      Right uri = parse unicodeEscParser "" (T.unpack t)
+      unicodeEscParser :: Stream s m Char => ParsecT s u m String
+      unicodeEscParser = do
+                ss <- many (
+                    try (do { _ <- char '\\'
+                            ; _ <- char 'U'
+                            ; pos1 <- hexDigit
+                            ; pos2 <- hexDigit
+                            ; pos3 <- hexDigit
+                            ; pos4 <- hexDigit
+                            ; pos5 <- hexDigit
+                            ; pos6 <- hexDigit
+                            ; pos7 <- hexDigit
+                            ; pos8 <- hexDigit
+                            ; let str = ['\\','x',pos1,pos2,pos3,pos4,pos5,pos6,pos7,pos8]
+                            ; return (read ("\"" ++ str ++ "\"") :: String)})
+                   <|>
+                    try (do { _ <- char '\\'
+                            ; _ <- char 'u'
+                            ; pos1 <- hexDigit
+                            ; pos2 <- hexDigit
+                            ; pos3 <- hexDigit
+                            ; pos4 <- hexDigit
+                            ; let str = ['\\','x',pos1,pos2,pos3,pos4]
+                            ; return (read ("\"" ++ str ++ "\"") :: String)})
+                   <|>
+                    (anyChar >>= \c -> return [c]))
+                return (concat ss :: String)
+
 
 -- |Return a blank node using the given string identifier.
 {-# INLINE bnode #-}
@@ -139,6 +241,12 @@ lnode = LNode
 -- See <http://www.w3.org/TR/rdf-concepts/#section-triples> for
 -- more information.
 data Triple = Triple !Node !Node !Node
+            deriving (Generic,Show)
+
+instance Binary Triple
+
+instance NFData Triple where
+  rnf (Triple s p o) = rnf s `seq` rnf p `seq` rnf o
 
 -- |A list of triples. This is defined for convenience and readability.
 type Triples = [Triple]
@@ -171,6 +279,16 @@ isBNode _            = False
 isLNode :: Node -> Bool
 isLNode (LNode _) = True
 isLNode _         = False
+
+{-# INLINE isAbsoluteUri #-}
+isAbsoluteUri :: T.Text -> Bool
+isAbsoluteUri = not
+                . uriIsRelative
+                . fromJust
+                . parseURIReference
+                . escapeURIString isUnescapedInURI
+                . encodeString
+                . T.unpack
 
 -- |A type class for ADTs that expose views to clients.
 class View a b where
@@ -206,7 +324,15 @@ class RDF rdf where
   mkRdf :: Triples -> Maybe BaseUrl -> PrefixMappings -> rdf
 
   -- |Return all triples in the RDF, as a list.
+  --
+  -- Note that this function returns a list of triples in the RDF as they
+  -- were added, without removing duplicates and without expanding namespaces.
   triplesOf :: rdf -> Triples
+
+  -- |Return unique triples in the RDF, as a list.
+  --
+  -- This function performs namespace expansion and removal of duplicates.
+  uniqTriplesOf :: rdf -> Triples
 
   -- |Select the triples in the RDF that match the given selectors.
   --
@@ -281,26 +407,26 @@ class RdfSerializer s where
   writeH      :: forall rdf. (RDF rdf) => s -> rdf -> IO ()
 
   -- |Write some triples to a file handle using whatever configuration is specified
-  -- by the first argument. 
-  -- 
-  -- WARNING: if the serialization format has header-level information 
+  -- by the first argument.
+  --
+  -- WARNING: if the serialization format has header-level information
   -- that should be output (e.g., \@prefix declarations for Turtle), then you should
   -- use 'hWriteG' instead of this method unless you're sure this is safe to use, since
-  -- otherwise the resultant document will be missing the header information and 
+  -- otherwise the resultant document will be missing the header information and
   -- will not be valid.
   hWriteTs    :: s -> Handle  -> Triples -> IO ()
 
   -- |Write some triples to stdout; equivalent to @'hWriteTs' stdout@.
   writeTs     :: s -> Triples -> IO ()
 
-  -- |Write a single triple to the file handle using whatever configuration is 
+  -- |Write a single triple to the file handle using whatever configuration is
   -- specified by the first argument. The same WARNING applies as to 'hWriteTs'.
   hWriteT     :: s -> Handle  -> Triple  -> IO ()
 
   -- |Write a single triple to stdout; equivalent to @'hWriteT' stdout@.
   writeT      :: s -> Triple  -> IO ()
 
-  -- |Write a single node to the file handle using whatever configuration is 
+  -- |Write a single node to the file handle using whatever configuration is
   -- specified by the first argument. The same WARNING applies as to 'hWriteTs'.
   hWriteN     :: s -> Handle  -> Node    -> IO ()
 
@@ -310,7 +436,9 @@ class RdfSerializer s where
 
 -- |The base URL of an RDF.
 newtype BaseUrl = BaseUrl T.Text
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, NFData, Generic)
+
+instance Binary BaseUrl
 
 -- |A 'NodeSelector' is either a function that returns 'True'
 --  or 'False' for a node, or Nothing, which indicates that all
@@ -429,23 +557,6 @@ compareLValue (TypedL l1 t1) (TypedL l2 t2) =
 
 instance Hashable LValue
 
--- String representations of the various data types; generally NTriples-like.
-
-instance Show Triple where
-  show (Triple s p o) =
-    printf "Triple(%s,%s,%s)" (show s) (show p) (show o)
-
-instance Show Node where
-  show (UNode uri)                   = "UNode(" ++ show uri ++ ")"
-  show (BNode  i)                    = "BNode(" ++ show i ++ ")"
-  show (BNodeGen genId)              = "BNodeGen(" ++ show genId ++ ")"
-  show (LNode lvalue)                = "LNode(" ++ show lvalue ++ ")"
-
-instance Show LValue where
-  show (PlainL lit)               = "PlainL(" ++ T.unpack lit ++ ")"
-  show (PlainLL lit lang)         = "PlainLL(" ++ T.unpack lit ++ ", " ++ T.unpack lang ++ ")"
-  show (TypedL lit dtype)         = "TypedL(" ++ T.unpack lit ++ "," ++ show dtype ++ ")"
-
 ------------------------
 -- Prefix mappings
 
@@ -466,7 +577,10 @@ instance Show Namespace where
 
 -- |An alias for a map from prefix to namespace URI.
 newtype PrefixMappings   = PrefixMappings (Map T.Text T.Text)
-  deriving (Eq, Ord)
+  deriving (Eq, Ord,NFData, Generic)
+
+instance Binary PrefixMappings
+
 instance Show PrefixMappings where
   -- This is really inefficient, but it's not used much so not what
   -- worth optimizing yet.
@@ -480,6 +594,74 @@ newtype PrefixMapping = PrefixMapping (T.Text, T.Text)
 instance Show PrefixMapping where
   show (PrefixMapping (prefix, uri)) = printf "PrefixMapping (%s, %s)" (show prefix) (show uri)
 
+-----------------
+-- Miscellaneous helper functions used throughout the project
+
+-- Resolve a prefix using the given prefix mappings and base URL. If the prefix is
+-- empty, then the base URL will be used if there is a base URL and if the map
+-- does not contain an entry for the empty prefix.
+resolveQName :: Maybe BaseUrl -> T.Text -> PrefixMappings -> Maybe T.Text
+resolveQName mbaseUrl prefix (PrefixMappings pms') =
+  case (mbaseUrl, T.null prefix) of
+    (Just (BaseUrl base), True)  ->  Just $ Map.findWithDefault base T.empty pms'
+    (_,                   _   )  ->  Map.lookup prefix pms'
+
+{- alternative implementation from Text.RDF.RDF4H.ParserUtils
+--
+-- Resolve a prefix using the given prefix mappings and base URL. If the prefix is
+-- empty, then the base URL will be used if there is a base URL and if the map
+-- does not contain an entry for the empty prefix.
+resolveQName :: Maybe BaseUrl -> T.Text -> PrefixMappings -> T.Text
+resolveQName mbaseUrl prefix (PrefixMappings pms') =
+  case (mbaseUrl, T.null prefix) of
+    (Just (BaseUrl base), True)  ->  Map.findWithDefault base T.empty pms'
+    (Nothing,             True)  ->  err1
+    (_,                   _   )  ->  Map.findWithDefault err2 prefix pms'
+  where
+    err1 = error  "Cannot resolve empty QName prefix to a Base URL."
+    err2 = error ("Cannot resolve QName prefix: " ++ T.unpack prefix)
+-}
+
+-- Resolve a URL fragment found on the right side of a prefix mapping
+-- by converting it to an absolute URL if possible.
+absolutizeUrl :: Maybe BaseUrl -> Maybe T.Text -> T.Text -> T.Text
+absolutizeUrl mbUrl mdUrl urlFrag =
+  if isAbsoluteUri urlFrag then urlFrag else
+    (case (mbUrl, mdUrl) of
+         (Nothing, Nothing) -> urlFrag
+         (Just (BaseUrl bUrl), Nothing) -> bUrl `T.append` urlFrag
+         (Nothing, Just dUrl) -> if isHash urlFrag then
+                                     dUrl `T.append` urlFrag else urlFrag
+         (Just (BaseUrl bUrl), Just dUrl) -> (if isHash urlFrag then dUrl
+                                                  else bUrl)
+                                                 `T.append` urlFrag)
+  where
+    isHash bs' = bs' == "#"
+
+{- alternative implementation from Text.RDF.RDF4H.ParserUtils
+--
+-- Resolve a URL fragment found on the right side of a prefix mapping by converting it to an absolute URL if possible.
+absolutizeUrl :: Maybe BaseUrl -> Maybe T.Text -> T.Text -> T.Text
+absolutizeUrl mbUrl mdUrl urlFrag =
+  if isAbsoluteUri urlFrag then urlFrag else
+    (case (mbUrl, mdUrl) of
+         (Nothing, Nothing) -> urlFrag
+         (Just (BaseUrl bUrl), Nothing) -> bUrl `T.append` urlFrag
+         (Nothing, Just dUrl) -> if isHash urlFrag then
+                                     dUrl `T.append` urlFrag else urlFrag
+         (Just (BaseUrl bUrl), Just dUrl) -> (if isHash urlFrag then dUrl
+                                                  else bUrl)
+                                                 `T.append` urlFrag)
+  where
+    isHash bs' = T.length bs' == 1 && T.head bs' == '#'
+-}
+
+{-# INLINE mkAbsoluteUrl #-}
+-- Make an absolute URL by returning as is if already an absolute URL and otherwise
+-- appending the URL to the given base URL.
+mkAbsoluteUrl :: T.Text -> T.Text -> T.Text
+mkAbsoluteUrl base url =
+    if isAbsoluteUri url then url else base `T.append` url
 
 -----------------
 -- Internal canonicalize functions, don't export
@@ -519,3 +701,11 @@ _decimalStr s =     -- haskell double parser doesn't handle '1.'..,
     '.' -> f (s `T.snoc` '0')
     _   -> f s
   where f s' = T.pack $ show (read $ T.unpack s' :: Double)
+
+-- | Removes "file://" schema from URIs in 'UNode' nodes
+fileSchemeToFilePath :: Node -> Maybe T.Text
+fileSchemeToFilePath (UNode fileScheme) =
+    if T.pack "file://" `T.isPrefixOf` fileScheme
+    then fmap (T.pack . Network.uriPath) (Network.parseURI (T.unpack fileScheme))
+    else Nothing
+fileSchemeToFilePath _ = Nothing

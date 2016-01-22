@@ -12,8 +12,7 @@ module Data.RDF.Namespace(
   -- * Predefined namespace values
   rdf, rdfs, dc, dct, owl, xsd, skos, foaf, ex, ex2,
   standard_ns_mappings, ns_mappings
-)
-where
+) where
 
 import qualified Data.Text as T
 import Data.RDF.Types
@@ -39,7 +38,7 @@ rdf   =   mkPrefixedNS' "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 rdfs :: Namespace
 rdfs  =   mkPrefixedNS'  "rdfs"  "http://www.w3.org/2000/01/rdf-schema#"
 
--- |The Dublic Core namespace.
+-- |The Dublin Core namespace.
 dc   :: Namespace
 dc    =   mkPrefixedNS'  "dc"    "http://purl.org/dc/elements/1.1/"
 

@@ -1,3 +1,5 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving , DeriveGeneric #-}
+
 -- |"TriplesGraph" contains a list-backed graph implementation suitable
 -- for smallish graphs or for temporary graphs that will not be queried.
 -- It maintains the triples in the order that they are given in, and is
@@ -8,15 +10,17 @@
 -- functions of this graph (select, query) remove duplicates from their
 -- result triples (but triplesOf does not) since it is usually cheap
 -- to do so.
-module Data.RDF.TriplesGraph(TriplesGraph, empty, mkRdf, triplesOf, select, query)
-
-where
+module Data.RDF.Graph.TriplesList (TriplesList) where
 
 import Prelude hiding (pred)
+import Control.DeepSeq (NFData)
+import Data.Binary
 import qualified Data.Map as Map
 import Data.RDF.Namespace
 import Data.RDF.Query
 import Data.RDF.Types
+import Data.List (nub)
+import GHC.Generics
 
 -- |A simple implementation of the 'RDF' type class that represents
 -- the graph internally as a list of triples.
@@ -37,50 +41,57 @@ import Data.RDF.Types
 --  * 'select'   : O(n)
 --
 --  * 'query'    : O(n)
-newtype TriplesGraph = TriplesGraph (Triples, Maybe BaseUrl, PrefixMappings)
+newtype TriplesList = TriplesList (Triples, Maybe BaseUrl, PrefixMappings)
+                       deriving (Generic,NFData)
 
-instance RDF TriplesGraph where
+instance Binary TriplesList
+
+instance RDF TriplesList where
   baseUrl           = baseUrl'
   prefixMappings    = prefixMappings'
   addPrefixMappings = addPrefixMappings'
   empty             = empty'
   mkRdf             = mkRdf'
   triplesOf         = triplesOf'
+  uniqTriplesOf     = uniqTriplesOf'
   select            = select'
   query             = query'
 
-instance Show TriplesGraph where
+instance Show TriplesList where
   show gr = concatMap (\t -> show t ++ "\n")  (triplesOf gr)
 
-prefixMappings' :: TriplesGraph -> PrefixMappings
-prefixMappings' (TriplesGraph (_, _, pms)) = pms
+prefixMappings' :: TriplesList -> PrefixMappings
+prefixMappings' (TriplesList (_, _, pms)) = pms
 
-addPrefixMappings' :: TriplesGraph -> PrefixMappings -> Bool -> TriplesGraph
-addPrefixMappings' (TriplesGraph (ts, baseURL, pms)) pms' replace =
+addPrefixMappings' :: TriplesList -> PrefixMappings -> Bool -> TriplesList
+addPrefixMappings' (TriplesList (ts, baseURL, pms)) pms' replace =
   let merge = if replace then flip mergePrefixMappings else mergePrefixMappings
-  in  TriplesGraph (ts, baseURL, merge pms pms')
+  in  TriplesList (ts, baseURL, merge pms pms')
   
-baseUrl' :: TriplesGraph -> Maybe BaseUrl
-baseUrl' (TriplesGraph (_, baseURL, _)) = baseURL
+baseUrl' :: TriplesList -> Maybe BaseUrl
+baseUrl' (TriplesList (_, baseURL, _)) = baseURL
 
-empty' :: TriplesGraph
-empty' = TriplesGraph ([], Nothing, PrefixMappings Map.empty)
+empty' :: TriplesList
+empty' = TriplesList ([], Nothing, PrefixMappings Map.empty)
 
 -- We no longer remove duplicates here, as it is very time consuming and is often not
 -- necessary (raptor does not seem to remove dupes either). Instead, we remove dupes
 -- from the results of the select' and query' functions, since it is cheap to do
 -- there in most cases, but not when triplesOf' is called.
-mkRdf' :: Triples -> Maybe BaseUrl -> PrefixMappings -> TriplesGraph
-mkRdf' ts baseURL pms = TriplesGraph (ts, baseURL, pms)
+mkRdf' :: Triples -> Maybe BaseUrl -> PrefixMappings -> TriplesList
+mkRdf' ts baseURL pms = TriplesList (ts, baseURL, pms)
 
-triplesOf' :: TriplesGraph -> Triples
-triplesOf' (TriplesGraph (ts, _, _)) = ts
+triplesOf' :: TriplesList -> Triples
+triplesOf' (TriplesList (ts, _, _)) = ts
 
-select' :: TriplesGraph -> NodeSelector -> NodeSelector -> NodeSelector -> Triples
-select' (TriplesGraph (ts, _, _)) s p o = removeDupes $ filter (matchSelect s p o) ts
+uniqTriplesOf' :: TriplesList -> Triples
+uniqTriplesOf' = nub . expandTriples
 
-query' :: TriplesGraph -> Maybe Subject -> Maybe Predicate -> Maybe Object -> Triples
-query' (TriplesGraph (ts, _, _)) s p o = removeDupes $ filter (matchPattern s p o) ts
+select' :: TriplesList -> NodeSelector -> NodeSelector -> NodeSelector -> Triples
+select' g s p o = filter (matchSelect s p o) $ triplesOf g
+
+query' :: TriplesList -> Maybe Subject -> Maybe Predicate -> Maybe Object -> Triples
+query' g s p o = filter (matchPattern s p o) $ triplesOf g
 
 matchSelect :: NodeSelector -> NodeSelector -> NodeSelector -> Triple -> Bool
 matchSelect s p o t =

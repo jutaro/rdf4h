@@ -7,6 +7,8 @@ module Text.RDF.RDF4H.TurtleParser(
 
 where
 
+import Data.Char (isLetter,isAlphaNum,toLower,toUpper)
+import Data.Maybe
 import Data.RDF.Types
 import Data.RDF.Namespace
 import Text.RDF.RDF4H.ParserUtils
@@ -20,10 +22,12 @@ import qualified Data.Sequence as Seq
 import qualified Data.Foldable as F
 import Data.Char (isDigit)
 import Control.Monad
-import Data.Maybe (fromMaybe)
+import Data.List
 
 -- |An 'RdfParser' implementation for parsing RDF in the
--- Turtle format. It takes optional arguments representing the base URL to use
+-- Turtle format. It is an implementation of W3C Turtle grammar rules at
+-- http://www.w3.org/TR/turtle/#sec-grammar-grammar .
+-- It takes optional arguments representing the base URL to use
 -- for resolving relative URLs in the document (may be overridden in the document
 -- itself using the \@base directive), and the URL to use for the document itself
 -- for resolving references to <> in the document.
@@ -40,7 +44,7 @@ instance RdfParser TurtleParser where
 
 type ParseState =
   (Maybe BaseUrl,    -- the current BaseUrl, may be Nothing initially, but not after it is once set
-   Maybe T.Text, -- the docUrl, which never changes and is used to resolve <> in the document.
+   Maybe T.Text,     -- the docUrl, which never changes and is used to resolve <> in the document.
    Int,              -- the id counter, containing the value of the next id to be used
    PrefixMappings,   -- the mappings from prefix to URI that are encountered while parsing
    [Subject],        -- stack of current subject nodes, if we have parsed a subject but not finished the triple
@@ -48,104 +52,215 @@ type ParseState =
    [Bool],           -- a stack of values to indicate that we're processing a (possibly nested) collection; top True indicates just started (on first element)
    Seq Triple)       -- the triples encountered while parsing; always added to on the right side
 
+-- grammar rule: [1] turtleDoc
 t_turtleDoc :: GenParser ParseState (Seq Triple, PrefixMappings)
 t_turtleDoc =
   many t_statement >> (eof <?> "eof") >> getState >>= \(_, _, _, pms, _, _, _, ts) -> return (ts, pms)
 
+-- grammar rule: [2] statement
 t_statement :: GenParser ParseState ()
 t_statement = d <|> t <|> void (many1 t_ws <?> "blankline-whitespace")
   where
     d = void
-      (try t_directive >> (many t_ws <?> "directive-whitespace1") >>
-      (char '.' <?> "end-of-directive-period") >>
+      (try t_directive >>
       (many t_ws <?> "directive-whitespace2"))
     t = void
       (t_triples >> (many t_ws <?> "triple-whitespace1") >>
       (char '.' <?> "end-of-triple-period") >>
       (many t_ws <?> "triple-whitespace2"))
 
+-- grammar rule: [6] triples
+-- subject predicateObjectList | blankNodePropertyList predicateObjectList?
 t_triples :: GenParser ParseState ()
-t_triples = t_subject >> (many1 t_ws <?> "subject-predicate-whitespace") >> t_predicateObjectList >> resetSubjectPredicate
+t_triples = do
+  try (t_subject >> many t_ws >> t_predicateObjectList >> resetSubjectPredicate) <|> (liftM BNodeGen nextIdCounter >>= \bSubj -> pushSubj bSubj >> t_blankNodePropertyList >> many t_ws >> optional t_predicateObjectList >> resetSubjectPredicate)
 
+-- [14]	blankNodePropertyList ::= '[' predicateObjectList ']'
+t_blankNodePropertyList :: GenParser ParseState ()
+t_blankNodePropertyList = between (char '[') (char ']') (many t_ws >> t_predicateObjectList >> void (many t_ws))
+
+-- grammar rule: [3] directive
 t_directive :: GenParser ParseState ()
-t_directive = t_prefixID <|> t_base
+t_directive = t_prefixID <|> t_base <|> t_sparql_prefix <|> t_sparql_base
 
-t_resource :: GenParser ParseState T.Text
-t_resource =  try t_uriref <|> t_qname
+-- grammar rule: [135s] iri
+-- IRIREF | PrefixedName
+t_iri :: GenParser ParseState T.Text
+t_iri =  try t_iriref <|> t_prefixedName
 
+-- grammar rule: [136s] PrefixedName
+t_prefixedName :: GenParser ParseState T.Text
+t_prefixedName = do
+  t <- try t_pname_ln <|> try t_pname_ns
+  return t
+
+-- grammar rule: [4] prefixID
 t_prefixID :: GenParser ParseState ()
 t_prefixID =
-  do try (string "@prefix" <?> "@prefix-directive")
-     pre <- (many1 t_ws <?> "whitespace-after-@prefix") >> option T.empty t_prefixName
-     char ':' >> (many1 t_ws <?> "whitespace-after-@prefix-colon")
-     uriFrag <- t_uriref
+  do void (try (string "@prefix" <?> "@prefix-directive"))
+     pre <- (many1 t_ws <?> "whitespace-after-@prefix") >> option T.empty t_pn_prefix
+     void (char ':' >> (many1 t_ws <?> "whitespace-after-@prefix-colon"))
+     uriFrag <- t_iriref
+     void (many t_ws <?> "prefixID-whitespace")
+     void (char '.' <?> "end-of-prefixID-period")
      (bUrl, dUrl, _, PrefixMappings pms, _, _, _, _) <- getState
      updatePMs $ Just (PrefixMappings $ Map.insert pre (absolutizeUrl bUrl dUrl uriFrag) pms)
      return ()
 
+-- grammar rule: [6s] sparqlPrefix
+t_sparql_prefix :: GenParser ParseState ()
+t_sparql_prefix =
+  do void (try (caseInsensitiveString "PREFIX" <?> "@prefix-directive"))
+     pre <- (many1 t_ws <?> "whitespace-after-@prefix") >> option T.empty t_pn_prefix
+     void (char ':' >> (many1 t_ws <?> "whitespace-after-@prefix-colon"))
+     uriFrag <- t_iriref
+     (bUrl, dUrl, _, PrefixMappings pms, _, _, _, _) <- getState
+     updatePMs $ Just (PrefixMappings $ Map.insert pre (absolutizeUrl bUrl dUrl uriFrag) pms)
+     return ()
+
+-- grammar rule: [5] base
 t_base :: GenParser ParseState ()
 t_base =
-  do try (string "@base" <?> "@base-directive")
-     many1 t_ws <?> "whitespace-after-@base"
-     urlFrag <- t_uriref
+  do void (try (string "@base" <?> "@base-directive"))
+     void (many1 t_ws <?> "whitespace-after-@base")
+     urlFrag <- t_iriref
+     void (many t_ws <?> "base-whitespace")
+     (void (char '.') <?> "end-of-base-period")
+     bUrl <- currBaseUrl
+     dUrl <- currDocUrl
+     updateBaseUrl (Just $ Just $ newBaseUrl bUrl (absolutizeUrl bUrl dUrl urlFrag))
+
+-- grammar rule: [5s] sparqlBase
+t_sparql_base :: GenParser ParseState ()
+t_sparql_base =
+  do void (try (caseInsensitiveString "BASE" <?> "@sparql-base-directive"))
+     void (many1 t_ws <?> "whitespace-after-BASE")
+     urlFrag <- t_iriref
      bUrl <- currBaseUrl
      dUrl <- currDocUrl
      updateBaseUrl (Just $ Just $ newBaseUrl bUrl (absolutizeUrl bUrl dUrl urlFrag))
 
 t_verb :: GenParser ParseState ()
+-- [9]	verb ::= predicate | 'a'
 t_verb = (try t_predicate <|> (char 'a' >> return rdfTypeNode)) >>= pushPred
 
+-- grammar rule: [11] predicate
 t_predicate :: GenParser ParseState Node
-t_predicate = liftM UNode (t_resource <?> "resource")
+t_predicate = liftM UNode (t_iri <?> "resource")
 
 t_nodeID  :: GenParser ParseState T.Text
-t_nodeID = do { try (string "_:"); cs <- t_name; return $! "_:" `T.append` cs }
+t_nodeID = do { void (try (string "_:")); cs <- t_name; return $! "_:" `T.append` cs }
 
-t_qname :: GenParser ParseState T.Text
-t_qname =
-  do pre <- option T.empty (try t_prefixName)
-     char ':'
-     name <- option T.empty t_name
-     (bUrl, _, _, pms, _, _, _, _) <- getState
-     return $ resolveQName bUrl pre pms `T.append` name
+-- grammar rules: [139s] PNAME_NS
+t_pname_ns :: GenParser ParseState T.Text
+t_pname_ns =do
+  pre <- option T.empty (try t_pn_prefix)
+  void (char ':')
+  (bUrl, _, _, pms, _, _, _, _) <- getState
+  case resolveQName bUrl pre pms of
+    Just n  -> return n
+    Nothing -> unexpected ("Cannot resolve QName prefix: " ++ T.unpack pre)
 
+-- grammar rules: [168s] PN_LOCAL
+-- [168s] PN_LOCAL ::= (PN_CHARS_U | ':' | [0-9] | PLX) ((PN_CHARS | '.' | ':' | PLX)* (PN_CHARS | ':' | PLX))?
+t_pn_local :: GenParser ParseState T.Text
+t_pn_local = do
+  x <- t_pn_chars_u_str <|> string ":" <|> satisfy_str <|> t_plx
+  xs <- option "" $ try $ do
+               let recsve = (t_pn_chars_str <|> string ":" <|> t_plx) <|>
+                            (t_pn_chars_str <|> string ":" <|> t_plx <|> try (string "." <* lookAhead (try recsve))) <|>
+                            (t_pn_chars_str <|> string ":" <|> t_plx <|> try (string "." >> notFollowedBy t_ws >> return "."))
+               concat <$> many recsve
+  return (T.pack (x ++ xs))
+    where
+      satisfy_str = satisfy (flip in_range [('0', '9')]) >>= \c -> return [c]
+      t_pn_chars_str = t_pn_chars >>= \c -> return [c]
+      t_pn_chars_u_str = t_pn_chars_u >>= \c -> return [c]
+
+-- PERCENT | PN_LOCAL_ESC
+-- grammar rules: [169s] PLX
+t_plx :: GenParser ParseState String
+t_plx = t_percent <|> t_pn_local_esc_str
+    where
+      t_pn_local_esc_str = do
+        c <- t_pn_local_esc
+        return ([c])
+
+--        '%' HEX HEX
+-- grammar rules: [170s] PERCENT
+t_percent :: GenParser ParseState String
+t_percent = do
+  void (char '%')
+  h1 <- t_hex
+  h2 <- t_hex
+  return (['%',h1,h2])
+
+-- grammar rules: [172s] PN_LOCAL_ESC
+t_pn_local_esc :: GenParser ParseState Char
+t_pn_local_esc = char '\\' >> oneOf "_~.-!$&'()*+,;=/?#@%"
+
+-- grammar rules: [140s] PNAME_LN
+t_pname_ln :: GenParser ParseState T.Text
+t_pname_ln =
+  do pre <- t_pname_ns
+     name <- t_pn_local
+     return (pre `T.append` name)
+
+-- grammar rule: [10] subject
+-- [10] subject	::= iri | BlankNode | collection
 t_subject :: GenParser ParseState ()
 t_subject =
-  simpleBNode <|>
-  resource <|>
-  nodeId <|>
-  between (char '[') (char ']') poList
+  iri <|>
+  t_blankNode <|>
+  t_collection
   where
-    resource    = liftM UNode (t_resource <?> "subject resource") >>= pushSubj
-    nodeId      = liftM BNode (t_nodeID <?> "subject nodeID") >>= pushSubj
-    simpleBNode = try (string "[]") >> nextIdCounter >>=  pushSubj . BNodeGen
-    poList      = void
-                (nextIdCounter >>= pushSubj . BNodeGen >> many t_ws >>
-                t_predicateObjectList >>
-                many t_ws)
+    iri         = liftM unode (try t_iri <?> "subject resource") >>= \s -> pushSubj s
 
--- verb ws+ objectList ( ws* ';' ws* verb ws+ objectList )* (ws* ';')?
+-- [137s] BlankNode ::= BLANK_NODE_LABEL | ANON
+t_blankNode :: GenParser ParseState ()
+t_blankNode = (try t_blank_node_label <|> t_anon) >> nextIdCounter >>= \i -> (pushSubj . BNodeGen) i
+
+-- TODO replicate the recursion technique from [168s] for ((..)* something)?
+-- [141s] BLANK_NODE_LABEL ::= '_:' (PN_CHARS_U | [0-9]) ((PN_CHARS | '.')* PN_CHARS)?
+t_blank_node_label :: GenParser ParseState ()
+t_blank_node_label = do
+  void (string "_:")
+  void (t_pn_chars_u <|> oneOf ['0'..'9'])
+  optional $ try $ do
+    ss <- option "" $ do
+            xs <- many (t_pn_chars <|> char '.')
+            if null xs
+            then return xs
+            else if last xs == '.'
+                 then unexpected "'.' at the end of a blank node label"
+                 else return xs
+    return ss
+
+-- [162s] ANON ::= '[' WS* ']'
+t_anon :: GenParser ParseState ()
+t_anon = between (char '[') (char ']') (void (many t_ws))
+
+-- [7] predicateObjectList ::= verb objectList (';' (verb objectList)?)*
 t_predicateObjectList :: GenParser ParseState ()
-t_predicateObjectList =
-  do t_verb <?> "verb"     -- pushes pred onto pred stack
-     many1 t_ws   <?> "polist-whitespace-after-verb"
-     t_objectList <?> "polist-objectList"
-     many (try (many t_ws >> char ';') >> many t_ws >> t_verb >> many1 t_ws >> t_objectList >> popPred)
-     popPred               -- pop off the predicate pushed by 1st t_verb
-     return ()
+t_predicateObjectList = do
+  void (sepEndBy1 (try (t_verb >> many1 t_ws >> t_objectList >> popPred)) (try (many t_ws >> char ';' >> optional (char ';') >> many t_ws)))
 
+-- grammar rule: [8] objectlist
+-- [8] objectList ::= object (',' object)*
 t_objectList :: GenParser ParseState ()
 t_objectList = -- t_object actually adds the triples
   void
   ((t_object <?> "object") >>
   many (try (many t_ws >> char ',' >> many t_ws >> t_object)))
 
+-- grammar rule: [12] object
+-- [12]	object ::= iri | BlankNode | collection | blankNodePropertyList | literal
 t_object :: GenParser ParseState ()
 t_object =
   do inColl      <- isInColl          -- whether this object is in a collection
      onFirstItem <- onCollFirstItem   -- whether we're on the first item of the collection
      let processObject = (t_literal >>= addTripleForObject) <|>
-                          (liftM UNode t_resource >>= addTripleForObject) <|>
+                          (liftM UNode t_iri >>= addTripleForObject) <|>
                           blank_as_obj <|> t_collection
      case (inColl, onFirstItem) of
        (False, _)    -> processObject
@@ -157,6 +272,7 @@ t_object =
 
 -- collection: '(' ws* itemList? ws* ')'
 -- itemList:      object (ws+ object)*
+-- grammar rule: [15] collection
 t_collection:: GenParser ParseState ()
 t_collection =
   -- ( object1 object2 ) is short for:
@@ -164,16 +280,16 @@ t_collection =
   -- ( ) is short for the resource:  rdf:nil
   between (char '(') (char ')') $
     do beginColl
-       many t_ws
+       void (many t_ws)
        emptyColl <- option True (try t_object  >> many t_ws >> return False)
        if emptyColl then void (addTripleForObject rdfNilNode) else
         void
          (many (many t_ws >> try t_object >> many t_ws) >> popPred >>
          pushPred rdfRestNode >>
          addTripleForObject rdfNilNode >>
-         popPred)
-       finishColl
-       return ()
+         popPred >> popSubj)
+       void finishColl
+
 
 blank_as_obj :: GenParser ParseState ()
 blank_as_obj =
@@ -189,7 +305,7 @@ blank_as_obj =
                  liftM BNodeGen nextIdCounter >>= \bSubj ->   -- generate new bnode
                   void
                   (addTripleForObject bSubj >>   -- add triple with bnode as object
-                  many t_ws >> pushSubj bSubj >> -- push bnode as new subject
+                  many t_ws >> (pushSubj bSubj) >> -- push bnode as new subject
                   t_predicateObjectList >> popSubj >> many t_ws) -- process polist, which uses bnode as subj, then pop bnode
 
 
@@ -200,73 +316,151 @@ rdfFirstNode  = UNode $ mkUri rdf "first"
 rdfRestNode   = UNode $ mkUri rdf "rest"
 
 xsdIntUri, xsdDoubleUri, xsdDecimalUri, xsdBooleanUri :: T.Text
-xsdIntUri     =   mkUri xsd "integer"
-xsdDoubleUri  =   mkUri xsd "double"
-xsdDecimalUri =  mkUri xsd "decimal"
-xsdBooleanUri =  mkUri xsd "boolean"
+xsdIntUri     = mkUri xsd "integer"
+xsdDoubleUri  = mkUri xsd "double"
+xsdDecimalUri = mkUri xsd "decimal"
+xsdBooleanUri = mkUri xsd "boolean"
 
 t_literal :: GenParser ParseState Node
 t_literal =
-  try str_literal <|>
-  liftM (`mkLNode` xsdIntUri) (try t_integer)   <|>
-  liftM (`mkLNode` xsdDoubleUri) (try t_double)  <|>
-  liftM (`mkLNode` xsdDecimalUri) (try t_decimal) <|>
+  (try t_rdf_literal >>= \l -> return (LNode l))   <|>
+  liftM (`mkLNode` xsdDoubleUri) (try t_double)    <|>
+  liftM (`mkLNode` xsdDecimalUri) (try t_decimal)  <|>
+  liftM (`mkLNode` xsdIntUri) (try t_integer)      <|>
   liftM (`mkLNode` xsdBooleanUri) t_boolean
-  where
+   where
     mkLNode :: T.Text -> T.Text -> Node
     mkLNode bsType bs' = LNode (typedL bsType bs')
 
-str_literal :: GenParser ParseState Node
-str_literal =
-  do str <- t_quotedString <?> "quotedString"
-     liftM (LNode . typedL str)
-      (try (count 2 (char '^')) >> t_resource) <|>
-      liftM (lnode . plainLL str) (char '@' >> t_language) <|>
-      return (lnode $ plainL str)
+-- [128s] RDFLiteral
+-- String (LANGTAG | '^^' iri)?
+t_rdf_literal :: GenParser ParseState LValue
+t_rdf_literal = do
+  str' <- t_string
+  let str = escapeRDFSyntax str'
+  option (plainL str) $ do
+                  (try (t_langtag >>= \lang -> return (plainLL str lang)) <|>
+                   ((count 2 (char '^') >> t_iri >>= \iri -> return (typedL str iri))))
 
-t_quotedString  :: GenParser ParseState T.Text
-t_quotedString = t_longString <|> t_string
+-- [17] String
+-- STRING_LITERAL_QUOTE | STRING_LITERAL_SINGLE_QUOTE | STRING_LITERAL_LONG_SINGLE_QUOTE | STRING_LITERAL_LONG_QUOTE
+t_string :: GenParser ParseState T.Text
+t_string = try t_string_literal_long_quote <|>
+           try t_string_literal_long_single_quote <|>
+           try t_string_literal_quote <|>
+           t_string_literal_single_quote
 
--- a non-long string: any number of scharacters (echaracter without ") inside doublequotes.
-t_string  :: GenParser ParseState T.Text
-t_string = liftM T.pack (between (char '"') (char '"') (many t_scharacter))
+-- [22]	STRING_LITERAL_QUOTE
+-- '"' ([^#x22#x5C#xA#xD] | ECHAR | UCHAR)* '"'
+t_string_literal_quote :: GenParser ParseState T.Text
+t_string_literal_quote =
+     between (char '"') (char '"') $ do
+      T.concat <$> many (T.singleton <$> noneOf ['\x22','\x5C','\xA','\xD'] <|>
+            t_echar <|>
+            t_uchar)
 
-t_longString  :: GenParser ParseState T.Text
-t_longString =
-  do
-    try tripleQuote
-    strVal <- liftM T.concat (many longString_char)
-    tripleQuote
-    return strVal
-  where
-    tripleQuote = count 3 (char '"')
+-- [23] STRING_LITERAL_SINGLE_QUOTE
+-- "'" ([^#x27#x5C#xA#xD] | ECHAR | UCHAR)* "'"
+t_string_literal_single_quote :: GenParser ParseState T.Text
+t_string_literal_single_quote =
+    between (char '\'') (char '\'') $ do
+      T.concat <$>
+       many (T.singleton <$> noneOf ['\x27','\x5C','\xA','\xD'] <|>
+             t_echar <|>
+             t_uchar)
 
+-- [24] STRING_LITERAL_LONG_SINGLE_QUOTE
+-- "'''" (("'" | "''")? ([^'\] | ECHAR | UCHAR))* "'''"
+t_string_literal_long_single_quote :: GenParser ParseState T.Text
+t_string_literal_long_single_quote =
+    between ((string "'''")) ((string "'''")) $ do
+      ss <- many $ try $ do
+        s1 <- T.pack <$> option "" (try (string "''") <|> string "'")
+        s2 <- T.singleton <$> noneOf ['\'','\\'] <|> t_echar <|> t_uchar
+        return (s1 `T.append` s2)
+      return (T.concat ss)
+
+-- [25] STRING_LITERAL_LONG_QUOTE
+-- '"""' (('"' | '""')? ([^"\] | ECHAR | UCHAR))* '"""'
+t_string_literal_long_quote :: GenParser ParseState T.Text
+t_string_literal_long_quote =
+     between (string "\"\"\"") (string "\"\"\"") $ do
+      ss <- many $ try $ do
+              s1 <- T.pack <$> option "" (try (string "\"\"") <|> string "\"")
+              s2 <- (T.singleton <$> noneOf ['"','\\']) <|> t_echar <|> t_uchar
+              return (s1 `T.append` s2)
+      return (T.concat ss)
+
+-- [144s] LANGTAG
+-- '@' [a-zA-Z]+ ('-' [a-zA-Z0-9]+)*
+t_langtag :: GenParser ParseState T.Text
+t_langtag = do
+    void (char '@')
+    ss   <- many1 (satisfy (\ c -> isLetter c))
+    rest <- concat <$> many (char '-' >> many1 (satisfy (\ c -> isAlphaNum c)) >>= \lang_str -> return ('-':lang_str))
+    return (T.pack (ss ++ rest))
+
+-- [159s]	ECHAR
+-- '\' [tbnrf"'\]
+t_echar :: GenParser ParseState T.Text
+t_echar = try $ do
+    void (char '\\')
+    c2 <- oneOf ['t','b','n','r','f','"','\'','\\']
+    return $ case c2 of
+               't'  -> T.singleton '\t'
+               'b'  -> T.singleton '\b'
+               'n'  -> T.singleton '\n'
+               'r'  -> T.singleton '\r'
+               'f'  -> T.singleton '\f'
+               '"'  -> T.singleton '\"'
+               '\'' -> T.singleton '\''
+               '\\' -> T.singleton '\\'
+               _    -> error "nt_echar: impossible error."
+
+-- [26]	UCHAR
+-- '\u' HEX HEX HEX HEX | '\U' HEX HEX HEX HEX HEX HEX HEX HEX
+t_uchar :: GenParser ParseState T.Text
+t_uchar =
+    (try (string "\\u" >> count 4 hexDigit) >>= \cs -> return $ T.pack ('\\':'u':cs)) <|>
+     (char '\\' >> char 'U' >> count 8 hexDigit >>= \cs -> return $ T.pack ('\\':'U':cs))
+
+-- [19] INTEGER ::= [+-]? [0-9]+
 t_integer :: GenParser ParseState T.Text
-t_integer =
+t_integer = try $
   do sign <- sign_parser <?> "+-"
-     ds <- many1 digit   <?> "digit"
-     notFollowedBy (char '.')
-     -- integer must be in canonical format, with no leading plus sign or leading zero
+     ds <- many1 (oneOf ['0'..'9'] <?> "digit")
      return $! ( T.pack sign `T.append` T.pack ds)
 
+-- grammar rule: [21] DOUBLE
+-- [21] DOUBLE ::= [+-]? ([0-9]+ '.' [0-9]* EXPONENT | '.' [0-9]+ EXPONENT | [0-9]+ EXPONENT)
 t_double :: GenParser ParseState T.Text
 t_double =
   do sign <- sign_parser <?> "+-"
-     rest <- try (do { ds <- many1 digit <?> "digit";  char '.'; ds' <- many digit <?> "digit"; e <- t_exponent <?> "exponent"; return ( T.pack ds `T.snoc` '.' `T.append`  T.pack ds' `T.append` e) }) <|>
-             try (do { char '.'; ds <- many1 digit <?> "digit"; e <- t_exponent <?> "exponent"; return ('.' `T.cons`  T.pack ds `T.append` e) }) <|>
-             try (do { ds <- many1 digit <?> "digit"; e <- t_exponent <?> "exponent"; return ( T.pack ds `T.append` e) })
+     rest <- try (do { ds <- many1 (oneOf ['0'..'9']) <?> "digit";
+                      void (char '.');
+                      ds' <- many (oneOf ['0'..'9']) <?> "digit";
+                      e <- t_exponent <?> "exponent";
+                      return ( T.pack ds `T.snoc` '.' `T.append`  T.pack ds' `T.append` e) }) <|>
+             try (do { void (char '.');
+                       ds <- many1 (oneOf ['0'..'9']) <?> "digit";
+                       e <- t_exponent <?> "exponent";
+                       return ('.' `T.cons`  T.pack ds `T.append` e) }) <|>
+                 (do { ds <- many1 (oneOf ['0'..'9']) <?> "digit";
+                       e <- t_exponent <?> "exponent";
+                       return ( T.pack ds `T.append` e) })
      return $! T.pack sign `T.append` rest
 
 sign_parser :: GenParser ParseState String
 sign_parser = option "" (oneOf "-+" >>= (\c -> return [c]))
 
+-- [20]	DECIMAL ::= [+-]? [0-9]* '.' [0-9]+
 t_decimal :: GenParser ParseState T.Text
-t_decimal =
-  do sign <- sign_parser
-     rest <- try (do ds <- many digit <?> "digit"; char '.'; ds' <- option "" (many digit); return (ds ++ ('.':ds')))
-             <|> try (do { char '.'; ds <- many1 digit <?> "digit"; return ('.':ds) })
-             <|> many1 digit <?> "digit"
-     return $ T.pack sign `T.append`  T.pack rest
+t_decimal = try $ do
+              sign <- sign_parser
+              dig1 <- many (oneOf ['0'..'9'])
+              void (char '.')
+              dig2 <- many1 (oneOf ['0'..'9'])
+              return (T.pack sign `T.append`  T.pack dig1 `T.append` T.pack "." `T.append` T.pack dig2)
 
 t_exponent :: GenParser ParseState T.Text
 t_exponent = do e <- oneOf "eE"
@@ -283,81 +477,48 @@ t_comment :: GenParser ParseState ()
 t_comment =
   void (char '#' >> many (satisfy (\ c -> c /= '\n' && c /= '\r')))
 
-t_ws  :: GenParser ParseState ()
+-- [161s] WS ::= #x20 | #x9 | #xD | #xA
+t_ws :: GenParser ParseState ()
 t_ws =
     (void (try (char '\t' <|> char '\n' <|> char '\r' <|> char ' '))
-    <|> try t_comment)
-   <?> "whitespace-or-comment"
+     <|> try t_comment)
+    <?> "whitespace-or-comment"
 
+-- grammar rule: [167s] PN_PREFIX
+t_pn_prefix :: GenParser ParseState T.Text
+t_pn_prefix = do
+  i <- try t_pn_chars_base
+  r <- option "" (many (try t_pn_chars <|> char '.')) -- TODO: ensure t_pn_chars is last char
+  return (T.pack (i:r))
 
-t_language  :: GenParser ParseState T.Text
-t_language =
-  do initial <- many1 lower;
-     rest <- many (do {char '-'; cs <- many1 (lower <|> digit); return ( T.pack ('-':cs))})
-     return $! ( T.pack initial `T.append` T.concat rest)
-
-identifier :: GenParser ParseState Char -> GenParser ParseState Char -> GenParser ParseState T.Text
-identifier initial rest = initial >>= \i -> many rest >>= \r -> return ( T.pack (i:r))
-
-t_prefixName :: GenParser ParseState T.Text
-t_prefixName = identifier t_nameStartCharMinusUnderscore t_nameChar
-
+-- (PN_CHARS_U | [0-9]) ((PN_CHARS | '.')* PN_CHARS)?
 t_name :: GenParser ParseState T.Text
-t_name = identifier t_nameStartChar t_nameChar
+t_name = try $ do
+           ch  <- t_pn_chars_u <|> oneOf ['0'..'9']
+           str <- many (t_pn_chars <|> char '.')
+           if last (ch:str) == '.'
+           then unexpected ("t_name: literal " ++ (ch:str) ++ " doesn't end with PN_CHARS")
+           else return (T.pack (ch : str))
 
-t_uriref :: GenParser ParseState T.Text
-t_uriref = between (char '<') (char '>') t_relativeURI
+-- [18] IRIREF
+t_iriref :: GenParser ParseState T.Text
+t_iriref =
+  between (char '<') (char '>') $ do
+    iri <- T.concat <$> many ( T.singleton <$> noneOf (['\x00'..'\x20'] ++ ['<','>','"','{','}','|','^','`','\\']) <|>
+                               t_uchar )
+    bUrl <- currBaseUrl
+    dUrl <- currDocUrl
+    let iri' = escapeRDFSyntax iri
+    validateURI (absolutizeUrl bUrl dUrl iri')
 
-t_relativeURI  :: GenParser ParseState T.Text
-t_relativeURI =
-  do frag <- liftM (T.pack . concat) (many t_ucharacter)
-     bUrl <- currBaseUrl
-     dUrl <- currDocUrl
-     return $ absolutizeUrl bUrl dUrl frag
-
--- We make this String rather than T.Text because we want
--- t_relativeURI (the only place it's used) to have chars so that
--- when it creates a T.Text it can all be in one chunk.
-t_ucharacter  :: GenParser ParseState String
-t_ucharacter =
-  try (liftM T.unpack unicode_escape) <|>
-  try (string "\\>") <|>
-  liftM (\c -> [c]) (non_ctrl_char_except ">")
-
-t_nameChar :: GenParser ParseState Char
-t_nameChar = t_nameStartChar <|> char '-' <|> char '\x00B7' <|> satisfy f
+t_pn_chars :: GenParser ParseState Char
+t_pn_chars = t_pn_chars_u <|> char '-' <|> char '\x00B7' <|> satisfy f
   where
     f = flip in_range [('0', '9'), ('\x0300', '\x036F'), ('\x203F', '\x2040')]
 
-longString_char  :: GenParser ParseState T.Text
-longString_char  =
-  specialChar        <|> -- \r|\n|\t as single char
-  try escapedChar    <|> -- an backslash-escaped tab, newline, linefeed, backslash or doublequote
-  try twoDoubleQuote <|> -- two doublequotes not followed by a doublequote
-  try oneDoubleQuote <|> -- a single doublequote
-  safeNonCtrlChar    <|> -- anything but a single backslash or doublequote
-  try unicode_escape     -- a unicode escape sequence (\uxxxx or \Uxxxxxxxx)
-  where
-    specialChar     = oneOf "\t\n\r" >>= bs1
-    escapedChar     =
-      do char '\\'
-         (char 't'  >> bs1 '\t') <|> (char 'n' >> bs1 '\n') <|> (char 'r' >> bs1 '\r') <|>
-          (char '\\' >> bs1 '\\') <|> (char '"' >> bs1 '"')
-    twoDoubleQuote  = string "\"\"" >> notFollowedBy (char '"') >> bs "\"\""
-    oneDoubleQuote  = char '"' >> notFollowedBy (char '"') >> bs1 '"'
-    safeNonCtrlChar = liftM T.singleton (non_ctrl_char_except "\\\"")
-
-bs1 :: Char -> GenParser ParseState T.Text
-bs1 = return . T.singleton
-
-bs :: String -> GenParser ParseState T.Text
-bs = return . T.pack
-
-t_nameStartChar  :: GenParser ParseState Char
-t_nameStartChar = char '_' <|> t_nameStartCharMinusUnderscore
-
-t_nameStartCharMinusUnderscore  :: GenParser ParseState Char
-t_nameStartCharMinusUnderscore = try $ satisfy $ flip in_range blocks
+-- grammar rule: [163s] PN_CHARS_BASE
+t_pn_chars_base :: GenParser ParseState Char
+t_pn_chars_base = try $ satisfy $ flip in_range blocks
   where
     blocks = [('A', 'Z'), ('a', 'z'), ('\x00C0', '\x00D6'),
               ('\x00D8', '\x00F6'), ('\x00F8', '\x02FF'),
@@ -367,78 +528,21 @@ t_nameStartCharMinusUnderscore = try $ satisfy $ flip in_range blocks
               ('\xF900', '\xFDCF'), ('\xFDF0', '\xFFFD'),
               ('\x10000', '\xEFFFF')]
 
-t_hex  :: GenParser ParseState Char
+-- grammar rule: [164s] PN_CHARS_U
+t_pn_chars_u :: GenParser ParseState Char
+t_pn_chars_u = t_pn_chars_base <|> char '_'
+
+-- grammar rules: [171s] HEX
+t_hex :: GenParser ParseState Char
 t_hex = satisfy (\c -> isDigit c || (c >= 'A' && c <= 'F')) <?> "hexadecimal digit"
-
--- characters used in (non-long) strings; any echaracters except ", or an escaped \"
--- echaracter - #x22 ) | '\"'
-t_scharacter  :: GenParser ParseState Char
-t_scharacter =
-  (try (string "\\\"") >> return '"')
-     <|> try (do {char '\\';
-                  (char 't' >> return '\t') <|>
-                  (char 'n' >> return '\n') <|>
-                  (char 'r' >> return '\r')}) -- echaracter part 1
-     <|> liftM (head . T.unpack) unicode_escape
-     <|> (non_ctrl_char_except "\\\"" >>= \s -> return $! s) -- echaracter part 2 minus "
-
-unicode_escape  :: GenParser ParseState T.Text
-unicode_escape =
- (char '\\' >> return (T.singleton '\\')) >>
- ((char '\\' >> return "\\\\") <|>
-  (char 'u' >> count 4 t_hex >>= \cs -> return $!  "\\u" `T.append`  T.pack cs) <|>
-  (char 'U' >> count 8 t_hex >>= \cs -> return $!  "\\U" `T.append` T.pack cs))
-
-non_ctrl_char_except  :: String -> GenParser ParseState Char
-non_ctrl_char_except cs =
-    (satisfy (\ c -> c <= '\1114111' && (c >= ' ' && c `notElem` cs)))
 
 {-# INLINE in_range #-}
 in_range :: Char -> [(Char, Char)] -> Bool
 in_range c = any (\(c1, c2) -> c >= c1 && c <= c2)
 
--- Resolve a prefix using the given prefix mappings and base URL. If the prefix is
--- empty, then the base URL will be used if there is a base URL and if the map
--- does not contain an entry for the empty prefix.
-resolveQName :: Maybe BaseUrl -> T.Text -> PrefixMappings -> T.Text
-resolveQName mbaseUrl prefix (PrefixMappings pms') =
-  case (mbaseUrl, T.null prefix) of
-    (Just (BaseUrl base), True)  ->  Map.findWithDefault base T.empty pms'
-    (Nothing,             True)  ->  err1
-    (_,                   _   )  ->  Map.findWithDefault err2 prefix pms'
-  where
-    err1 = error  "Cannot resolve empty QName prefix to a Base URL."
-    err2 = error ("Cannot resolve QName prefix: " ++ T.unpack prefix)
-
--- Resolve a URL fragment found on the right side of a prefix mapping by converting it to an absolute URL if possible.
-absolutizeUrl :: Maybe BaseUrl -> Maybe T.Text -> T.Text -> T.Text
-absolutizeUrl mbUrl mdUrl urlFrag =
-  if isAbsoluteUri urlFrag then urlFrag else
-    (case (mbUrl, mdUrl) of
-         (Nothing, Nothing) -> urlFrag
-         (Just (BaseUrl bUrl), Nothing) -> bUrl `T.append` urlFrag
-         (Nothing, Just dUrl) -> if isHash urlFrag then
-                                     dUrl `T.append` urlFrag else urlFrag
-         (Just (BaseUrl bUrl), Just dUrl) -> (if isHash urlFrag then dUrl
-                                                  else bUrl)
-                                                 `T.append` urlFrag)
-  where
-    isHash bs' = T.length bs' == 1 && T.head bs' == '#'
-
-{-# INLINE isAbsoluteUri #-}
-isAbsoluteUri :: T.Text -> Bool
-isAbsoluteUri = T.isInfixOf (T.pack [':'])
-
 newBaseUrl :: Maybe BaseUrl -> T.Text -> BaseUrl
-newBaseUrl Nothing                url = BaseUrl url
+newBaseUrl Nothing               url = BaseUrl url
 newBaseUrl (Just (BaseUrl bUrl)) url = BaseUrl $! mkAbsoluteUrl bUrl url
-
-{-# INLINE mkAbsoluteUrl #-}
--- Make an absolute URL by returning as is if already an absolute URL and otherwise
--- appending the URL to the given base URL.
-mkAbsoluteUrl :: T.Text -> T.Text -> T.Text
-mkAbsoluteUrl base url =
-  if isAbsoluteUri url then url else base `T.append` url
 
 currBaseUrl :: GenParser ParseState (Maybe BaseUrl)
 currBaseUrl = getState >>= \(bUrl, _, _, _, _, _, _, _) -> return bUrl
@@ -532,9 +636,9 @@ addTripleForObject :: Object -> GenParser ParseState ()
 addTripleForObject obj =
   do (bUrl, dUrl, i, pms, ss, ps, cs, ts) <- getState
      when (null ss) $
-       error $ "No Subject with which to create triple for: " ++ show obj
+       unexpected $ "No Subject with which to create triple for: " ++ show obj
      when (null ps) $
-       error $ "No Predicate with which to create triple for: " ++ show obj
+       unexpected $ "No Predicate with which to create triple for: " ++ show obj
      setState (bUrl, dUrl, i, pms, ss, ps, cs, ts |> Triple (head ss) (head ps) obj)
 
 -- |Parse the document at the given location URL as a Turtle document, using an optional @BaseUrl@
@@ -552,11 +656,11 @@ addTripleForObject obj =
 -- to @\<>@ within the document is expanded to the value given here. Additionally, if no @BaseUrl@ is
 -- given and no @\@base@ directive has appeared before a relative URI occurs, this value is used as the
 -- base URI against which the relative URI is resolved.
---p
+--
 -- Returns either a @ParseFailure@ or a new RDF containing the parsed triples.
 parseURL' :: forall rdf. (RDF rdf) =>
                  Maybe BaseUrl       -- ^ The optional base URI of the document.
-                 -> Maybe T.Text -- ^ The document URI (i.e., the URI of the document itself); if Nothing, use location URI.
+                 -> Maybe T.Text     -- ^ The document URI (i.e., the URI of the document itself); if Nothing, use location URI.
                  -> String           -- ^ The location URI from which to retrieve the Turtle document.
                  -> IO (Either ParseFailure rdf)
                                      -- ^ The parse result, which is either a @ParseFailure@ or the RDF
@@ -569,7 +673,7 @@ parseURL' bUrl docUrl = _parseURL (parseString' bUrl docUrl)
 --
 -- Returns either a @ParseFailure@ or a new RDF containing the parsed triples.
 parseFile' :: forall rdf. (RDF rdf) => Maybe BaseUrl -> Maybe T.Text -> String -> IO (Either ParseFailure rdf)
-parseFile' bUrl docUrl fpath =
+parseFile' bUrl docUrl fpath = do
   TIO.readFile fpath >>= \bs' -> return $ handleResult bUrl (runParser t_turtleDoc initialState (maybe "" T.unpack docUrl) bs')
   where initialState = (bUrl, docUrl, 1, PrefixMappings Map.empty, [], [], [], Seq.empty)
 
@@ -586,5 +690,25 @@ handleResult bUrl result =
     (Left err)         -> Left (ParseFailure $ show err)
     (Right (ts, pms))  -> Right $! mkRdf (F.toList ts) bUrl pms
 
-_testParseState :: ParseState
-_testParseState = (Nothing, Nothing, 1, PrefixMappings Map.empty, [], [], [], Seq.empty)
+validateUNode :: T.Text -> GenParser ParseState Node
+validateUNode t =
+    case unodeValidate t of
+      Nothing        -> unexpected ("Invalid URI in Turtle parser URI validation: " ++ show t)
+      Just u@(UNode{}) -> return u
+      Just node      -> unexpected ("Unexpected node in Turtle parser URI validation: " ++ show node)
+
+validateURI :: T.Text -> GenParser ParseState T.Text
+validateURI t = do
+    UNode uri <- validateUNode t
+    return uri
+
+--------------
+-- auxiliary parsing functions
+
+-- Match the lowercase or uppercase form of 'c'
+caseInsensitiveChar :: Char -> GenParser ParseState Char
+caseInsensitiveChar c = char (toLower c) <|> char (toUpper c)
+
+-- Match the string 's', accepting either lowercase or uppercase form of each character
+caseInsensitiveString :: String -> GenParser ParseState String
+caseInsensitiveString s = try (mapM caseInsensitiveChar s) <?> "\"" ++ s ++ "\""

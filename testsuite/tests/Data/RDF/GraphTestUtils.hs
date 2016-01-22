@@ -3,22 +3,64 @@ module Data.RDF.GraphTestUtils where
 import Data.RDF.Types
 import Data.RDF.Query
 import Data.RDF.Namespace
+import Text.RDF.RDF4H.NTriplesSerializer
 import qualified Data.Text as T
 import Test.QuickCheck
 import Data.List
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 import Control.Monad
+import System.Directory (removeFile)
 import System.IO.Unsafe(unsafePerformIO)
+import System.IO
+
+import Test.Tasty
+import Test.Tasty.QuickCheck
+import Test.QuickCheck.Monadic (assert, monadicIO,run)
+
+----------------------------------------------------
+--  property based quick check test cases         --
+----------------------------------------------------
+
+graphTests :: forall rdf. (Arbitrary rdf, RDF rdf, Show rdf)
+           => TestName -> (rdf -> Triples) -> (rdf -> Triples) -> rdf -> (Triples -> Maybe BaseUrl -> PrefixMappings -> rdf) -> TestTree
+graphTests testGroupName _triplesOf _uniqTriplesOf _empty _mkRdf = testGroup testGroupName
+            [
+              testProperty "empty"                      (p_empty _triplesOf _empty)
+            , testProperty "mkRdf_triplesOf"            (p_mkRdf_triplesOf _triplesOf _mkRdf)
+            , testProperty "mkRdf_no_dupes"             (p_mkRdf_no_dupes _uniqTriplesOf _mkRdf)
+            , testProperty "query_match_none"           (p_query_match_none _mkRdf)
+            , testProperty "query_matched_spo"          (p_query_matched_spo _triplesOf)
+            -- see comment above p_query_matched_spo_no_dupes for why this is disabled
+            -- , testProperty "query_matched_spo_no_dupes" (p_query_matched_spo_no_dupes _triplesOf _mkRdf)
+            , testProperty "query_unmatched_spo"        (p_query_unmatched_spo _triplesOf)
+            , testProperty "query_match_s"              (p_query_match_s _triplesOf)
+            , testProperty "query_match_p"              (p_query_match_p _triplesOf)
+            , testProperty "query_match_o"              (p_query_match_o _triplesOf)
+            , testProperty "query_match_sp"             (p_query_match_sp _triplesOf)
+            , testProperty "query_match_so"             (p_query_match_so _triplesOf)
+            , testProperty "query_match_po"             (p_query_match_po _triplesOf)
+            , testProperty "select_match_none"          (p_select_match_none _triplesOf)
+            , testProperty "select_match_s"             (p_select_match_s _triplesOf)
+            , testProperty "select_match_p"             (p_select_match_p _triplesOf)
+            , testProperty "select_match_o"             (p_select_match_o _triplesOf)
+            , testProperty "select_match_sp"            (p_select_match_sp _triplesOf)
+            , testProperty "select_match_so"            (p_select_match_so _triplesOf)
+            , testProperty "select_match_po"            (p_select_match_po _triplesOf)
+            , testProperty "select_match_spo"           (p_select_match_spo _triplesOf)
+            , testProperty "reversed RDF handle write"  (p_reverseRdfTest _mkRdf)
+            ]
+
 
 instance Arbitrary BaseUrl where
-  arbitrary = oneof $ map (return . BaseUrl . T.pack) ["http://example.com/a", "http://asdf.org/b"]
+  arbitrary = oneof $ map (return . BaseUrl . T.pack) ["http://example.com/a","http://asdf.org/b","http://asdf.org/c"]
   --coarbitrary = undefined
 
 instance Arbitrary PrefixMappings where
   arbitrary = oneof [return $ PrefixMappings Map.empty, return $ PrefixMappings $
                           Map.fromAscList [(T.pack "eg1", T.pack "http://example.com/1"),
-                                        (T.pack "eg2", T.pack "http://example.com/2")]]
+                                           (T.pack "eg2", T.pack "http://example.com/2"),
+                                           (T.pack "eg3", T.pack "http://example.com/3")]]
   --coarbitrary = undefined
 
 -- Test stubs, which just require the appropriate RDF impl function
@@ -33,14 +75,19 @@ p_mkRdf_triplesOf :: RDF rdf => (rdf -> Triples) -> (Triples -> Maybe BaseUrl ->
 p_mkRdf_triplesOf _triplesOf _mkRdf ts bUrl pms =
   uordered (_triplesOf (_mkRdf ts bUrl pms)) == uordered ts
 
--- duplicate input triples should not be returned
+-- duplicate input triples should not be returned when
+-- uniqTriplesof is used
 p_mkRdf_no_dupes :: RDF rdf => (rdf -> Triples) -> (Triples -> Maybe BaseUrl -> PrefixMappings -> rdf) -> Triples -> Maybe BaseUrl -> PrefixMappings -> Bool
-p_mkRdf_no_dupes _triplesOf _mkRdf ts bUrl pms =
-  null ts || (sortTriples result == sortTriples (uordered ts))
+p_mkRdf_no_dupes _uniqtriplesOf _mkRdf ts bUrl pms =
+  null ts || (sort result == uordered ts)
    where
     tsWithDupe = head ts : ts
-    result = _triplesOf $ _mkRdf tsWithDupe bUrl pms
+    result = _uniqtriplesOf $ _mkRdf tsWithDupe bUrl pms
 
+-- Note: in TriplesGraph and PatriciaTreeGraph `query` expands triples
+--       but `ts` here is not  necessarily expanded. What is the correct
+--       property this test should check?
+--
 -- query with all 3 wildcards should yield all triples in RDF
 p_query_match_none :: RDF rdf => (Triples -> Maybe BaseUrl -> PrefixMappings -> rdf) -> Triples -> Maybe BaseUrl -> PrefixMappings -> Bool
 p_query_match_none  _mkRdf ts bUrl pms = uordered ts == uordered result
@@ -59,6 +106,10 @@ p_query_matched_spo _triplesOf rdf =
             Nothing   ->  True
             (Just t') ->  [t'] == queryT rdf t'
 
+{- disabled:
+-- removing duplicates from `query` (and `select`) is deprecated, see
+--  https://github.com/cordawyn/rdf4h/commit/9dd4729908db8d2f80088706592adac81a0f3016
+--
 -- query as in p_query_matched_spo after duplicating a triple in the
 -- RDF, so that we can verify that the results just have 1, even
 -- if the RDF itself doesn't ensure that there are no dupes internally.
@@ -71,6 +122,7 @@ p_query_matched_spo_no_dupes _triplesOf _mkRdf rdf =
     f t = case t of
             Nothing   -> True
             Just t'   -> [t'] == queryT (mkRdfWithDupe _triplesOf _mkRdf rdf t') t'
+-}
 
 -- query with no wildcard and a triple no in the RDF should yield []
 p_query_unmatched_spo :: RDF rdf => (rdf -> Triples) -> rdf -> Triple -> Property
@@ -135,11 +187,15 @@ mk_query_match_fn tripleCompareFn  mkPatternFn _triplesOf rdf =
         all (tripleCompareFn t) results &&
         all (not . tripleCompareFn t) notResults
 
-p_select_match_none :: RDF rdf => rdf -> Bool
-p_select_match_none rdf = sortTriples ts1 == sortTriples ts2
+p_select_match_none :: RDF rdf => (rdf -> Triples) -> rdf -> Bool
+p_select_match_none _triplesOf_not_used rdf = sort ts1 == sort ts2
     where
       ts1 = select rdf Nothing Nothing Nothing
-      ts2 = removeDupes (triplesOf rdf)
+      -- ts2 = (nub . triplesOf) rdf
+
+      -- may have duplicates, see comments in
+      --   https://github.com/cordawyn/rdf4h/commit/9dd4729908db8d2f80088706592adac81a0f3016
+      ts2 = triplesOf rdf
 
 p_select_match_s :: RDF rdf => (rdf -> Triples) -> rdf -> Property
 p_select_match_s =
@@ -259,7 +315,7 @@ sameObj  t1 t2 = objectOf t1 == objectOf t2
 
 -- Convert a list of triples into a sorted list of unique triples.
 uordered :: Triples -> Triples
-uordered  =  nub . sortTriples
+uordered  =  sort . nub
 
 tripleFromGen :: RDF rdf => (rdf -> Triples) -> rdf -> Gen (Maybe Triple)
 tripleFromGen _triplesOf rdf =
@@ -320,7 +376,6 @@ arbitraryTs = do
   n <- sized (\_ -> choose (0, maxN))
   sequence [arbitrary | _ <- [1..n]]
 
-
 arbitraryT :: Gen Triple
 arbitraryT = elements test_triples
 
@@ -332,4 +387,30 @@ arbitraryS = oneof $ map return $ unodes ++ bnodes
 arbitraryP = oneof $ map return unodes
 arbitraryO = oneof $ map return $ unodes ++ bnodes ++ lnodes
 
+----------------------------------------------------
+--  Unit test cases                               --
+----------------------------------------------------
 
+-- Reported by Daniel Bergey:
+--   https://github.com/robstewart57/rdf4h/issues/4
+
+p_reverseRdfTest :: RDF rdf => (Triples -> Maybe BaseUrl -> PrefixMappings -> rdf) -> Property
+p_reverseRdfTest _mkRdf = monadicIO $ do
+    fileContents <- Test.QuickCheck.Monadic.run $ do
+      (pathFile,hFile) <- openTempFile "." "tmp."
+      hWriteRdf NTriplesSerializer hFile rdfGraph
+      hClose hFile
+      contents <- readFile pathFile
+      removeFile pathFile
+      return contents
+    let expected = "<file:///this/is/not/a/palindrome> <file:///this/is/not/a/palindrome> \"literal string\" .\n"
+    assert $ expected == fileContents
+
+  where
+    rdfGraph = _mkRdf ts (Just $ BaseUrl "file://") (ns_mappings [])
+
+    ts :: [Triple]
+    ts = [Triple
+           (unode "file:///this/is/not/a/palindrome")
+           (unode "file:///this/is/not/a/palindrome")
+           (LNode . PlainL . T.pack $ "literal string")]
