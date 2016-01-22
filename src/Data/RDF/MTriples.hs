@@ -28,6 +28,7 @@ import qualified Data.Map as Map
 import Data.RDF.Namespace (mergePrefixMappings)
 import Data.RDF.Query (objectOf, subjectOf)
 import Data.Foldable (foldl')
+import Data.Maybe (fromMaybe)
 
 -- |Another map-based graph implementation.
 
@@ -94,32 +95,20 @@ select' mt cfs cfp cfo = filter selectIt (triplesOf' mt)
 
 query' :: MTriples -> Maybe Subject -> Maybe Predicate -> Maybe Object -> Triples
 query' (MTriples ((sm,_),_,_)) (Just s) Nothing Nothing =
-    case Map.lookup s sm of
-        Nothing -> []
-        Just r -> r
+    fromMaybe [] (Map.lookup s sm)
 query' (MTriples ((sm,_),_,_)) (Just s) Nothing (Just o) =
-    case Map.lookup s sm of
-        Nothing -> []
-        Just r -> filter (\ (Triple _ _ o') -> o == o') r
+    maybe [] (filter (\ (Triple _ _ o') -> o == o')) (Map.lookup s sm)
 query' (MTriples ((sm,_),_,_)) (Just s) (Just p) Nothing =
-    case Map.lookup s sm of
-        Nothing -> []
-        Just r -> filter (\ (Triple _ p' _) -> p == p') r
+    maybe [] (filter (\ (Triple _ p' _) -> p == p')) (Map.lookup s sm)
 query' (MTriples ((sm,_),_,_)) (Just s) (Just p) (Just o) =
-    case Map.lookup s sm of
-        Nothing -> []
-        Just r -> filter (\ (Triple _ p' o') -> p == p' && o == o') r
+    maybe [] (filter (\ (Triple _ p' o') -> p == p' && o == o')) (Map.lookup s sm)
 query' (MTriples ((_,om),_,_)) Nothing Nothing (Just o) =
-    case Map.lookup o om of
-        Nothing -> []
-        Just r -> r
+    fromMaybe [] (Map.lookup o om)
 query' (MTriples ((_,om),_,_)) Nothing (Just p) (Just o) =
-    case Map.lookup o om of
-        Nothing -> []
-        Just r -> filter (\ (Triple _ p' _) -> p == p') r
+    maybe [] (filter (\ (Triple _ p' _) -> p == p')) (Map.lookup o om)
 -- and now the slow case:
 query' mt Nothing (Just p) Nothing =
-    select' mt Nothing (Just (\ p' -> p' == p)) Nothing
+    select' mt Nothing (Just (== p)) Nothing
 query' mt Nothing Nothing Nothing =
     triplesOf' mt
 
